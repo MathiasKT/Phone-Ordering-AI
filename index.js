@@ -1,5 +1,6 @@
 //ENV
 require("@dotenvx/dotenvx").config();
+
 //Server
 const express = require("express");
 const xlsx = require("xlsx");
@@ -11,8 +12,67 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 const port = process.env.PORT || 3000;
 
+//MENU
+const MENU_DATA = createMenuJSON();
+const ALLERGEN_DATA = null; // TODO
+const aliasMap = {
+    // Pizzas
+    "margherita pizza": "Margherita",
+    "cheese pizza": "Margherita",
+    "plain pizza": "Margherita",
+    "pepperoni pizza": "Diavola",
+    "spicy salami pizza": "Diavola",
+    "spicy pizza": "Diavola",
+    "anchovy pizza": "Napoli",
+    "ham and mushroom": "Prosciutto e Funghi",
+    "spinach and egg": "Fiorentina Virgin",
+    "florentine pizza": "Fiorentina Virgin",
+    "parma ham pizza": "Sebastian",
+    "nduja pizza": "Calabrese",
+    "vegetarian pizza": "Vegetariana",
+    "veg pizza": "Vegetariana",
 
-//twilio 
+    // Starters / Breads
+    "cheesy garlic bread": "Garlic Bread with Cheese",
+    "garlic bread cheese": "Garlic Bread with Cheese",
+    "tomato garlic bread": "Garlic Bread Marinara",
+    "bowl of olives": "Mixed Olives",
+    "tomato bruschetta": "Bruschetta Classica",
+    
+    // Platters / Mains / Salads
+    "meat board": "Tagliere di Terra",
+    "meat platter": "Tagliere di Terra",
+    "charcuterie": "Tagliere di Terra",
+    "vegetarian platter": "Antipasto Vegetariano",
+    "veg platter": "Antipasto Vegetariano",
+    "soup of the day": "Zuppa del Giorno",
+    "soup": "Zuppa del Giorno",
+    "beef carpaccio": "Carpaccio di Manzo",
+    "caprese salad": "Insalata Caprese",
+    "tomato and mozzarella salad": "Insalata Caprese",
+    "king prawns": "Gamberoni alla Sebastian",
+    "prawns": "Gamberoni alla Sebastian",
+    "bowl of mussels": "Mussels",
+    "veal": "Vitello Tonnato",
+    "goat cheese salad": "Caprino Grigliato",
+    "grilled goat cheese": "Caprino Grigliato",
+    "eggplant parmigiana": "Melanzana Small",
+    "aubergine parmigiana": "Melanzana Small",
+    "baked aubergine": "Melanzana Small"
+  };
+
+
+
+//SEARCH
+const Fuse = require("fuse.js");
+const FUSE_OPTIONS = {
+  includeScore: true,
+  threshold: 0.45,
+  keys: [{ name: "Name", weight: 0.8 }, { name: "Description", weight: 0.2 }]
+}
+const fuse = new Fuse(MENU_DATA, FUSE_OPTIONS);
+
+//twilio
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 console.log("SID loaded:", !!process.env.TWILIO_ACCOUNT_SID);
@@ -38,9 +98,7 @@ const client = require('twilio')(accountSid, authToken,{
 });
 
 
-//MENU
-const MENU_DATA = createMenuJSON();
-const ALLERGEN_DATA = null; // TODO
+
 
 // ROUTES
 app.get("/", (req, res) => {
@@ -77,7 +135,7 @@ app.post("/voice/incoming", (req, res) => {
 app.post("/voice/process", async (req, res) => {
     const  callSid = req.body.CallSid;
     const callerNumber = req.body.From || "anonymous"; 
-    console.log("gathering info from " + callerNumber + " (SID: " + callSid + ")");
+    //console.log("gathering info from " + callerNumber + " (SID: " + callSid + ")");
 
     // get text from speech recognition and add to conversation history
     const userSpeech = req.body.SpeechResult || "";
@@ -91,13 +149,41 @@ app.post("/voice/process", async (req, res) => {
       session.conversationHistory.push({ role: "user", parts: [{ text: userSpeech }] });
     }
 
+    if (session.pendingItem && userSpeech) {
+    const lastEntry = session.conversationHistory[session.conversationHistory.length - 1];
+    lastEntry.parts[0].text += ` [SYSTEM: The customer was previously asked to confirm "${session.pendingItem.item.Name}". If their response is positive (yes, sure, ok, that's fine etc.), return action CONFIRM_ITEM. If negative, clear the suggestion and ask what they want instead.]`;
+    }
+
     // query ai for response
     const [action, items, AIresponse] = await queryAI(session.conversationHistory);
-    session.conversationHistory.push({ role: "model", parts: [{ text: AIresponse }] });
     
+    const finalSpeech = (await decideAction(action, items, session)) || AIresponse;
+    session.conversationHistory.push({ role: "model", parts: [{ text: finalSpeech }] });
+
     console.log("############");
+    console.log("Action:", action, "| Items:", JSON.stringify(items));
     console.log("AI responded: ", AIresponse);
+    if (finalSpeech !== AIresponse) console.log("System Overrode Speech to: ", finalSpeech);
     console.log("############");
+
+    //base condition for ending call
+    if (action === "CONFIRM_ORDER") {
+      await confirmOrder(session.callSid);
+      const twiml = new VoiceResponse();
+      twiml.say({ voice: speaker, language: language }, AIresponse);
+      twiml.hangup();
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
+
+  if (action === "CANCEL_ORDER") {
+    cancelOrder(session.callSid);
+    const twiml = new VoiceResponse();
+    twiml.say({ voice: speaker, language: language }, AIresponse);
+    twiml.hangup();
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
     //build and send twiml response based on AI response
     const twiml = new VoiceResponse();
@@ -107,7 +193,7 @@ app.post("/voice/process", async (req, res) => {
         speechTimeout: "auto",
     });
 
-    gather.say( { voice: speaker, language: language },AIresponse);
+    gather.say( { voice: speaker, language: language },finalSpeech);
 
     res.type("text/xml");
     res.send(twiml.toString());
@@ -117,9 +203,6 @@ app.post("/voice/process", async (req, res) => {
     console.log("############");
 
     await decideAction(action, items, session);
-    twiml.redirect("/voice/process");
-
-
 });
 
 
@@ -177,7 +260,8 @@ function getOrCreateSession(callSid, callerNumber) {
       id: uuidv4(),
       callSid,
       callerNumber,
-      items: [],          // { item, quantity }
+      items: [],          // { item, quantity, modifiers }
+      pendingItem: null, // item waiting for confirmation { item, quantity, modifiers }
       status: "ordering", // ordering | confirmed | cancelled
       createdAt: new Date(),
       conversationHistory: [], //  message history
@@ -188,27 +272,68 @@ function getOrCreateSession(callSid, callerNumber) {
 
 //ACTIONS
 async function decideAction(action, items, session) {
-  //"ADD_ITEM", "REMOVE_ITEM", "SHOW_ORDER", "CONFIRM_ORDER", "CANCEL_ORDER", "REPEAT_MENU", "UNKNOWN"
+  //"ADD_ITEM", "REMOVE_ITEM", "CONFIRM_ITEM" "SHOW_ORDER", "CONFIRM_ORDER", "CANCEL_ORDER", "SAY_MENU", "UNKNOWN"
+  var overrideSpeech;
+
+
     switch(action){
         case "ADD_ITEM":
             items.forEach(item => {
-                addItemToSession(session.callSid, item.Name, item.quantity);
-            });
+                var res = addItemToSession(session.callSid, item.Name, item.quantity);
+                if (!res.success && res.pending) {
+                    overrideSpeech = res.message;
+                    } else if (!res.success) {
+                        overrideSpeech = res.message;
+                    }
+                    console.log(`[ADD_ITEM] ${item.Name} →`, res);
+                });
+                break;
+              
+        case "CONFIRM_ITEM":
+            if (session.pendingItem) {
+                const { item, quantity } = session.pendingItem;
+                const existing = session.items.find(l => l.item.Id === item.Id);
+                if (existing) {
+                    existing.quantity += quantity;
+                } else {
+                    session.items.push({ item, quantity });
+                }
+                session.pendingItem = null; // clear it
+            }
             break;
+      
         case "REMOVE_ITEM":
             items.forEach(item => {
-                removeItemFromSession(session.callSid, item.Name);
+               removeItemFromSession(session.callSid, item.Name);
             });
             break;
-        case "SHOW_ORDER":
+        case "TELL_ORDER":
             // no action needed - order summary is generated dynamically in AI response
             break;
-        case "CONFIRM_ORDER":
-            await confirmOrder(session.callSid);
+          
+        case "GIVE_PRODUCT_DETAILS":
             break;
-        case "CANCEL_ORDER":
-            cancelOrder(session.callSid);
+
+        case "GIVE_RECOMMENDATION":
+          if (!items || items.length === 0) {
+                overrideSpeech = "I'd recommend trying our Margherita or Garlic Bread — both very popular. What sounds good?";
+                break;
+          }
+            // Validate each recommended item actually exists
+            const validItems = items
+                .map(i => findItem(i.Name))
+                .filter(r => r.status === "found")
+                .map(r => r.item.Name);
+
+            if (validItems.length === 0) {
+                // AI hallucinated everything — use a safe fallback
+                overrideSpeech = "I'd recommend our Margherita pizza or Garlic Bread — both very popular. What sounds good?";
+            } else {
+                // Build speech from only validated items
+                overrideSpeech = `I'd recommend ${validItems.join(" or ")} — both great choices. What sounds good to you?`;
+            }
             break;
+        
         case "REPEAT_MENU":
             // no action needed - menu is included in system prompt
             break;
@@ -216,16 +341,54 @@ async function decideAction(action, items, session) {
             // no action needed - AI will generate a response asking user to repeat
             break;
     }
+    return overrideSpeech;
 }
 
+//working
 function findItem(Name) {
   /// TODO: use nlp to map name to menu item e.g margherita pizza -> margherita 
-  const menu = MENU_DATA;
-  const item = menu.find(i => i.Name.toLowerCase() === Name.toLowerCase());
-  console.log("Found item:", JSON.stringify(item));
-  return item;
+
+
+
+  for (const [alias, realName] of Object.entries(aliasMap)) {
+    if (Name.includes(alias)) {
+      // If it's an alias, do a strict search for the real name
+      const match = fuse.search(realName)[0];
+      return {
+        status: 'alias',
+        item: match.item,
+        message: `We don't have ${alias}, but we do have the ${match.item.Name}.`
+      };
+    }
+  }
+
+  const result = fuse.search(Name);
+
+  if (result.length > 0) {
+    console.log("Fuzzy search results:", result);
+    var best_match  = result[0];
+
+    if (best_match.score < 0.3) { // adjust threshold as needed
+      console.log(`Fuzzy match found for "${Name}":`, best_match);
+      return {
+        status: "found",
+        item: best_match.item,
+      };
+    }
+    else {
+      return { status: "alias", item: best_match.item, message:`weak match ${best_match.item.Name}` };
+    }
+  }
+  else{
+    console.log("No fuzzy match found for:", Name);
+    return {
+      status: "not_found",
+      item: null
+    };
+  }
 }
 
+// working
 function addItemToSession(callSid, itemName, quantity = 1) {
   const session = sessions.get(callSid);
   if (!session) {
@@ -235,40 +398,73 @@ function addItemToSession(callSid, itemName, quantity = 1) {
     };
   }
 
-  const item = findItem(itemName);
+  const result = findItem(itemName);
 
-  if (!item) {
-    return {
-      success: false,
-      message: `Sorry, I couldn't find "${itemName}" on our menu.`
+  switch (result.status) {
+    case "not_found":
+      return {
+        success: false,
+        message: `Sorry, I couldn't find "${itemName}" on our menu.`
+      };
+    case "alias":
+      // confirm with user if they meant the recommended item
+      session.pendingItem = { item: result.item, quantity };
+      return {
+        success: false,
+        pending: true,
+        item: result.item,
+        message: `We don't have that, but we have ${result.item.Name}. Would you like that instead?`
+      };
+    default:
+    case "found":
+        const existing = session.items.find(l => l.item.Id === result.item.Id);
+        if (existing) {
+          // Update quantity if item already in order
+          existing.quantity += quantity;
+        } else {
+          session.items.push({ item: result.item, quantity });
+        }
+
+        return { success: true, item: result.item, quantity };
+  }
+
+ 
+}
+
+
+//working
+function removeItemFromSession(callSid, itemName) {
+  const session = sessions.get(callSid);
+  
+  if (!session || !session.items || session.items.length === 0) {
+    return { success: false, message: "Your order is currently empty." };
+  }
+
+  const cartItems = session.items.map(cartRow => cartRow.item);
+
+  const tempFuseOptions = { includeScore: true, threshold: 0.5, keys: ["Name"] };
+  const cartSearch = new Fuse(cartItems, tempFuseOptions);
+  
+  const result = cartSearch.search(itemName);
+
+  if (result.length === 0 || result[0].score > 0.4) {
+    return { 
+      success: false, 
+      message: `I couldn't find ${itemName} in your current order.` 
     };
   }
 
-  // Update quantity if item already in order
-  const existing = session.items.find(l => l.item.Id === item.Id);
-  if (existing) {
-    existing.quantity += quantity;
+  const matchedItem = result[0].item;
+  const idx = session.items.findIndex(l => l.item.Id === matchedItem.Id);
+
+  if (session.items[idx].quantity > 1) {
+    session.items[idx].quantity -= 1;
   } else {
-    session.items.push({ item, quantity });
+    session.items.splice(idx, 1);
   }
 
-  return { success: true, item, quantity };
+  return { success: true, item: matchedItem };
 }
-
-function removeItemFromSession(callSid, itemName) {
-  const session = sessions.get(callSid);
-  if (!session) return { success: false };
-
-  const item = findItem(itemName);
-  if (!item) return { success: false, message: `Couldn't find "${itemName}" to remove.` };
-
-  const idx = session.items.findIndex(l => l.item.Id === item.Id);
-  if (idx === -1) return { success: false, message: `${item.Name} isn't in your order.` };
-
-  session.items.splice(idx, 1);
-  return { success: true, item };
-}
-
 function getOrderTotal(callSid) {
   const session = sessions.get(callSid);
   if (!session) return 0;
@@ -319,12 +515,13 @@ function cancelOrder(callSid) {
   if (session) {
     session.items = [];
     session.status = "cancelled";
+    session.pendingItem = null;
   }
 }
 
 // BUILD MENU JSON FROM EXCEL
 function createMenuJSON() {
-    const workbook = xlsx.readFile(path.join(__dirname, "data", "menu_timings.xlsx"));
+    const workbook = xlsx.readFile(path.join(__dirname, "data", "menu_timings_shortened.xlsx"));
 
     const menu = workbook.Sheets[workbook.SheetNames[0]];
     const menuJSON = xlsx.utils.sheet_to_json(menu);
@@ -345,6 +542,8 @@ function createMenuJSON() {
 //AI HELPER FUNCTIONS
 const SYSTEM_PROMPT = `You are a friendly and efficient phone ordering assistant for a restaurant or takeaway.
 Your job is to help callers place food orders over the phone.
+- GIVE_RECOMMENDATION: You MUST populate the "items" array with 2-3 real items from the MENU JSON.
+  Your "speech" should reference ONLY those exact item names. Do not mention any item not in the items array.
 
 MENU:
 `+JSON.stringify(MENU_DATA)+`
@@ -352,14 +551,25 @@ MENU:
 RULES:
 - Be concise — responses are read aloud over the phone, so keep them SHORT (1-3 sentences max).
 - Always be warm, friendly, and professional.
-- Only take orders from the menu above. Politely decline requests for items not listed.
+- Only take orders from the menu above. Politely decline requests for items not listed on MENU JSON.
 - Quantities default to 1 unless the caller specifies otherwise.
-- After each item is added, confirm it back to the caller briefly.
+- NEVER invent menu items. 
+- GIVE_RECOMMENDATION: You MUST choose items ONLY from the MENU JSON above. 
+  Copy the Name field EXACTLY as it appears. Put chosen items in the "items" array.
+  If you cannot find suitable items in the menu, use action UNKNOWN instead.
+  NEVER mention food that does not appear in the MENU JSON — not in speech, not in items.
+
+CRITICAL: You do NOT decide if an item is on the menu. When a customer requests an item, 
+  return ADD_ITEM with the name they said EXACTLY as spoken. The system will check if it exists 
+  and handle suggestions. NEVER say you have added an item until the system confirms it.
+  If the customer asks for something, ALWAYS use ADD_ITEM and let the system validate it.
+  Your speech for ADD_ITEM should be "Let me check if we have that for you..." NOT 
+  "I've added X to your order."
 
 CRITICAL INSTRUCTION:
 You must ALWAYS respond with a single JSON object that strictly matches this format. Do NOT wrap it in an array:
 {
-  "action": "ADD_ITEM" | "REMOVE_ITEM" | "SHOW_ORDER" | "CONFIRM_ORDER" | "CANCEL_ORDER" | "REPEAT_MENU" | "UNKNOWN",
+  "action": "ADD_ITEM" | "CONFIRM_ITEM" | "REMOVE_ITEM" |  "CONFIRM_ORDER" | "CANCEL_ORDER" | "TELL_ORDER" | "GIVE_CATEGORY_DETAILS" | "GIVE_PRODUCT_DETAILS" | "GIVE_RECOMMENDATION" | "REPEAT_MENU" | "UNKNOWN",
   "items": [
     { "Name": "Exact Menu Item Name", "quantity": 1 }
   ],
@@ -367,7 +577,7 @@ You must ALWAYS respond with a single JSON object that strictly matches this for
 }`;
 
 const ActionSchema = z.object({
-    action: z.enum(["ADD_ITEM", "REMOVE_ITEM", "SHOW_ORDER", "CONFIRM_ORDER", "CANCEL_ORDER", "REPEAT_MENU", "UNKNOWN"]),
+    action: z.enum(["ADD_ITEM", "CONFIRM_ITEM", "REMOVE_ITEM", "TELL_ORDER", "CONFIRM_ORDER", "CANCEL_ORDER", "GIVE_PRODUCT_DETAILS", "GIVE_RECOMMENDATION", "REPEAT_MENU", "UNKNOWN"]),
     items: z.array(z.object({
         Name: z.string(),
         quantity: z.number().optional(),
@@ -377,7 +587,7 @@ const ActionSchema = z.object({
 
 async function queryAI( conversationHistory = []) {
     const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.1-flash-lite-preview",
         systemInstruction: SYSTEM_PROMPT,
         contents: conversationHistory,
         config: {
